@@ -16,3 +16,4 @@ jobs:
     timeout-minutes: 3
     steps:
       - run: sw_vers && echo "Mac runner started - the free iPhone route works here."
+# moved to Mandate Games 15 Nov 23:15
