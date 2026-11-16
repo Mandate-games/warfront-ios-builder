@@ -1,0 +1,253 @@
+name: Warfront iPhone and iPad to TestFlight (free Mac in a public repo)
+# Job row 893 (owner 15 Nov 2026: "come up with a different plan for Apple, because I'm not paying $150").
+# iPhone apps can only be compiled on a Mac; GitHub's Macs are free in PUBLIC repositories. This public repository holds
+# NO game code and NO keys: everything comes from our own game server's builder (game repo server/builder) as ONE
+# private file, downloaded with the link in the only secret here, WARFRONT_BUILDS_URL. Nothing is kept: no artifacts,
+# no uploaded logs (they would be public), the work folder is deleted at the end. Every key value is masked in the log.
+# TestFlight only (owner 15 Nov 19:12): App Review only after the owner has played the build.
+# Steps after the download are the ones of the builds repo's ios-149-testflight.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      version: {description: "Version made by the server builder, e.g. 1.50", required: true}
+permissions:
+  contents: read
+concurrency:
+  group: warfront-ios
+  cancel-in-progress: false
+jobs:
+  # A 1-minute Linux check first, so no Mac starts when the server has not made the input yet.
+  ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: The iPhone input must be on the game server
+        env:
+          BASE: ${{ secrets.WARFRONT_BUILDS_URL }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          [ -n "$BASE" ] || { echo "::error::Secret WARFRONT_BUILDS_URL is missing (see README)"; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "::error::version looks wrong"; exit 1; }
+          curl -fsI "$BASE/warfront-ios-input-$VERSION.tar" >/dev/null || { echo "::error::No iPhone input for $VERSION on the game server yet (builder-status.json)"; exit 1; }
+          echo "iPhone input for $VERSION is ready."
+  ios:
+    needs: ready
+    runs-on: macos-15-intel
+    timeout-minutes: 240
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Download the iPhone input from the game server (private link)
+        env:
+          BASE: ${{ secrets.WARFRONT_BUILDS_URL }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 "$BASE/warfront-ios-input-$VERSION.tar" -o "$RUNNER_TEMP/in.tar"
+          tar -xf "$RUNNER_TEMP/in.tar" && rm -f "$RUNNER_TEMP/in.tar"
+          for f in script-encryption-key asc-key-id asc-issuer-id apple-team-id asc-key.p8; do
+            test -s "keys/$f" || { echo "::error::keys/$f missing in the input"; exit 1; }
+          done
+          for f in script-encryption-key asc-key-id asc-issuer-id apple-team-id; do echo "::add-mask::$(tr -d '\r\n' < keys/$f)"; done
+          python3 - <<'PY'
+          import json, os
+          d = json.load(open("IOS_INPUT.json"))
+          assert d["version"] == os.environ["VERSION"], d
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write("BUILD=%s\n" % d["build"])
+              env.write("TEAM=%s\n" % open("keys/apple-team-id").read().strip())
+              env.write("KEY_ID=%s\nASC_KEY_ID=%s\n" % ((open("keys/asc-key-id").read().strip(),) * 2))
+              env.write("ISSUER=%s\nASC_ISSUER_ID=%s\n" % ((open("keys/asc-issuer-id").read().strip(),) * 2))
+              env.write("GODOT_SCRIPT_ENCRYPTION_KEY=%s\n" % open("keys/script-encryption-key").read().strip())
+          print("Input for", d["version"], "build", d["build"], "from", d["source"][:8])
+          PY
+          mkdir -p /tmp/enc && cp enc/ios.zip /tmp/enc/ios.zip
+      - name: Install Godot 4.6.3 for Mac and the export templates (checked against Godot's published sums)
+        run: |
+          set -euo pipefail
+          base=https://github.com/godotengine/godot/releases/download/4.6.3-stable
+          curl -fL --retry 3 "$base/SHA512-SUMS.txt" -o /tmp/sums.txt
+          curl -fL --retry 3 "$base/Godot_v4.6.3-stable_macos.universal.zip" -o /tmp/Godot_v4.6.3-stable_macos.universal.zip
+          curl -fL --retry 3 "$base/Godot_v4.6.3-stable_export_templates.tpz" -o /tmp/Godot_v4.6.3-stable_export_templates.tpz
+          (cd /tmp && grep -E " (Godot_v4.6.3-stable_macos.universal.zip|Godot_v4.6.3-stable_export_templates.tpz)$" sums.txt | shasum -a 512 -c -)
+          echo "3fbe2c0e2dec9d537ab9ec97bcf8da91dcf23357fc51f67092dd068d839290a8  /tmp/Godot_v4.6.3-stable_export_templates.tpz" | shasum -a 256 -c -
+          unzip -q /tmp/Godot_v4.6.3-stable_macos.universal.zip -d /tmp/godot-app
+          echo "GODOT=/tmp/godot-app/Godot.app/Contents/MacOS/Godot" >> "$GITHUB_ENV"
+          T="$HOME/Library/Application Support/Godot/export_templates/4.6.3.stable"; mkdir -p "$T" /tmp/tpl
+          unzip -q /tmp/Godot_v4.6.3-stable_export_templates.tpz 'templates/ios.zip' 'templates/version.txt' -d /tmp/tpl
+          mv /tmp/tpl/templates/* "$T/"
+          rm /tmp/Godot_v4.6.3-stable_export_templates.tpz
+      - name: Use the newest Xcode on the runner
+        run: |
+          x=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v -i beta | sort -V | tail -1)
+          [ -n "$x" ] && sudo xcode-select -s "$x"
+          xcodebuild -version
+      - name: Import all models (restored and generated on the game server)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          "$GODOT" --headless --path source/game --editor --import --quit >dist/import.log 2>&1 || true
+          if grep -E 'SCRIPT ERROR|Parse Error' dist/import.log; then exit 1; fi
+      - name: App Store icon (1024 x 1024, no transparency) and the iOS export settings
+        run: |
+          set -euo pipefail
+          cat > source/game/ios_make_icon.gd <<'GD'
+          extends SceneTree
+          ## The App Store icon: the game's icon on its own edge colour, 1024 x 1024 (Apple refuses transparency).
+          func _initialize() -> void:
+          	var svg: = FileAccess.get_file_as_bytes("res://assets/interface/app_icon.svg")
+          	var img: = Image.new()
+          	img.load_svg_from_buffer(svg, 1.0)
+          	var scale: float = 1024.0 / maxf(img.get_width(), img.get_height())
+          	img = Image.new(); img.load_svg_from_buffer(svg, scale)
+          	img.convert(Image.FORMAT_RGBA8)
+          	var edge: = img.get_pixel(img.get_width() / 2, 4)
+          	edge.a = 1.0
+          	var rgba: = Image.create(1024, 1024, false, Image.FORMAT_RGBA8)
+          	rgba.fill(edge)
+          	rgba.blend_rect(img, Rect2i(Vector2i.ZERO, img.get_size()), (Vector2i(1024, 1024) - img.get_size()) / 2)
+          	rgba.convert(Image.FORMAT_RGB8)
+          	rgba.save_png("res://ios_icon_1024.png")
+          	print("ICON ok")
+          	quit()
+          GD
+          "$GODOT" --headless --path source/game --script res://ios_make_icon.gd | grep "ICON ok"
+          "$GODOT" --headless --path source/game --editor --import --quit >>dist/import.log 2>&1 || true
+          [ -n "$TEAM" ] || TEAM=AAAAAAAAAA  # compile-only run before the secrets exist
+          export TEAM
+          python3 - <<'PY'
+          import os,re
+          from pathlib import Path
+          p=Path('source/game/export_presets.cfg'); cfg=p.read_text()
+          include=re.search(r'^include_filter=.*$',cfg,re.M).group(0)
+          n=len(re.findall(r'^\[preset\.\d+\]$',cfg,re.M))  # Godot reads presets 0,1,2... in order
+          cfg+='''
+          [preset.N]
+
+          name="iOS"
+          platform="iOS"
+          runnable=true
+          advanced_options=false
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          %s
+          exclude_filter="*.fbx,tests/*"
+          export_path="../../dist/ios/WarfrontMandate.ipa"
+          patches=PackedStringArray()
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          seed=0
+          encrypt_pck=false
+          encrypt_directory=false
+          script_export_mode=1
+
+          [preset.N.options]
+
+          application/app_store_team_id="%s"
+          application/export_method_release=0
+          application/bundle_identifier="com.warfrontmandate.game"
+          application/signature=""
+          application/short_version="%s"
+          application/version="%s"
+          application/export_project_only=true
+          application/min_ios_version="15.0"
+          application/targeted_device_family=2
+          architectures/arm64=true
+          icons/icon_1024x1024="res://ios_icon_1024.png"
+          '''.replace('preset.N','preset.%d' % n) % (include, os.environ['TEAM'], os.environ['VERSION'], os.environ['BUILD'])
+          p.write_text(cfg)
+          PY
+      - name: Leave out the unit models the phones download from the server (job row 696; list from the Android build)
+        run: |
+          set -euo pipefail
+          python3 source/tools/apply_app_extras.py source/game/export_presets.cfg ax/app_extras.json ax/exclude.txt source/game
+          test -s source/game/data/app_extras.json
+      - name: Turn on file encryption (this run's copy of the presets only)
+        run: python3 tools/apply_script_encryption.py source/game/export_presets.cfg --ios-template /tmp/enc/ios.zip
+      - name: Sign in with Apple - build the native part and switch it on (game job row 735)
+        run: |
+          set -euo pipefail
+          if [ -f source/tools/ios_apple_signin.py ]; then
+            python3 source/tools/ios_apple_signin.py prepare source/game source/game/export_presets.cfg
+          else
+            echo "This game source has no Sign in with Apple yet (row 735); skipped."
+          fi
+      - name: Export the Xcode project
+        run: |
+          set -uo pipefail
+          mkdir -p dist/ios
+          "$GODOT" --headless --path source/game --export-release iOS "$GITHUB_WORKSPACE/dist/ios/WarfrontMandate.ipa" >dist/ios-export.log 2>&1
+          tail -n 20 dist/ios-export.log
+          test -d dist/ios/WarfrontMandate.xcodeproj || { echo "::error::Godot did not write the Xcode project"; grep -iE "error" dist/ios-export.log | tail -20; exit 1; }
+          ls -la dist/ios
+      - name: Sign in with Apple - entitlement in the exported project (game job row 735)
+        run: |
+          set -euo pipefail
+          if [ -f source/game/ios/plugins/AppleSignIn/AppleSignIn.a ]; then
+            python3 source/tools/ios_apple_signin.py entitle dist/ios
+            grep -rl "AppleSignIn\|apple_signin_init" dist/ios --include=*.mm --include=*.pbxproj | head -5
+          fi
+      - name: Check the game file is really encrypted
+        run: |
+          set -euo pipefail
+          P=$(find dist/ios -maxdepth 2 -name "*.pck" | head -1)
+          echo "game file: $P ($(du -h "$P" | cut -f1))"
+          python3 tools/check_encrypted_pck.py "$P" --require-code
+      - name: Make the signing certificate and App Store profile through the App Store Connect API
+        if: true
+        env:
+          BUNDLE_ID: com.warfrontmandate.game
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          KEY="$HOME/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8"
+          cp keys/asc-key.p8 "$KEY"; chmod 600 "$KEY"
+          echo "ASC_KEY_PATH=$KEY" >> "$GITHUB_ENV"
+          python3 -m pip install --quiet --break-system-packages pyjwt cryptography 2>/dev/null || python3 -m pip install --quiet --user pyjwt cryptography
+          APPLE_TEAM_ID="$TEAM" ASC_KEY_PATH="$KEY" python3 ci/ios_signing.py setup
+      - name: Archive with Xcode (manual signing with that certificate and profile)
+        if: true
+        run: |
+          set -euo pipefail
+          cd dist/ios
+          xcodebuild -project WarfrontMandate.xcodeproj -scheme WarfrontMandate -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/WarfrontMandate.xcarchive" \
+            DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="$IOS_PROFILE_NAME" OTHER_CODE_SIGN_FLAGS="--keychain $IOS_KEYCHAIN" \
+            archive > "$GITHUB_WORKSPACE/dist/archive.log" 2>&1 \
+            || { grep -E "error:|Error|failed" "$GITHUB_WORKSPACE/dist/archive.log" | tail -30 | while IFS= read -r l; do echo "::error title=archive::${l:0:300}"; done; exit 1; }
+          tail -n 3 "$GITHUB_WORKSPACE/dist/archive.log"
+      - name: Make the App Store package and upload it to TestFlight
+        if: true
+        env:
+          UPLOAD: "true"
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>teamID</key><string>$TEAM</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key><dict><key>com.warfrontmandate.game</key><string>$IOS_PROFILE_NAME</string></dict>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/WarfrontMandate.xcarchive" -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$GITHUB_WORKSPACE/dist/ios-out" > dist/export.log 2>&1 \
+            || { grep -E "error|Error|failed" dist/export.log | tail -30 | while IFS= read -r l; do echo "::error title=export::${l:0:300}"; done; exit 1; }
+          IPA=$(ls dist/ios-out/*.ipa | head -1); ls -la "$IPA"
+          if [ "$UPLOAD" != "true" ]; then echo "Signed $IPA (not uploaded)"; exit 0; fi
+          xcrun altool --upload-app -f "$IPA" -t ios --apiKey "$KEY_ID" --apiIssuer "$ISSUER" --output-format normal > dist/upload.log 2>&1 \
+            || { grep -iE "error|fail" dist/upload.log | tail -30 | while IFS= read -r l; do echo "::error title=upload::${l:0:300}"; done; exit 1; }
+          tail -n 8 dist/upload.log
+          echo "Uploaded $VERSION ($BUILD) to App Store Connect. It shows in TestFlight after Apple's processing (about 10-30 minutes)."
+      - name: Remove the temporary certificate, profile, keychain and key
+        if: always()
+        run: |
+          if [ -n "${ASC_KEY_PATH:-}" ] && [ -f "$ASC_KEY_PATH" ]; then python3 ci/ios_signing.py cleanup || true; fi
+          rm -rf "$HOME/.appstoreconnect/private_keys" "$RUNNER_TEMP/ios-signing" keys source dist
