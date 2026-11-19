@@ -1,0 +1,60 @@
+name: Send a TestFlight build to App Review (replaces the one waiting)
+# Owner 18 Nov 2026 21:35 ("Yes": swap 1.59 in for 1.57 at App Review) and 22:17 (chose this job in the free public repo;
+# Actions is off on the private builds repo). A small Linux job, no Mac. Like the iPhone build it holds NO keys: the
+# App Store key comes from the same private download (secret WARFRONT_BUILDS_URL), is masked, and is deleted at the end.
+# review/asc_submit.py holds no private text; the reviewer information is copied from the version on sale at run time.
+on:
+  workflow_dispatch:
+    inputs:
+      version: {description: "Version already uploaded to TestFlight by the iPhone build, e.g. 1.59", required: true}
+      replace_pending: {description: "take the version waiting for review out of review and make it this version (yes/empty)", default: "yes"}
+      whats_new: {description: "What's New text for every language (empty = keep the text already there)", default: ""}
+      status_only: {description: "only list the versions and their review states (yes/empty)", default: ""}
+permissions:
+  contents: read
+concurrency:
+  group: warfront-app-review
+  cancel-in-progress: false
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {sparse-checkout: review}
+      - name: The App Store key from the game server's private download
+        env:
+          BASE: ${{ secrets.WARFRONT_BUILDS_URL }}
+        run: |
+          set -euo pipefail
+          [ -n "$BASE" ] || { echo "::error::Secret WARFRONT_BUILDS_URL is missing"; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "::error::version looks wrong"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/in" && cd "$RUNNER_TEMP/in"
+          curl -fsSL --retry 3 "$BASE/warfront-ios-input-$VERSION.tar" -o in.tar
+          tar -xf in.tar && rm -f in.tar
+          for f in asc-key-id asc-issuer-id asc-key.p8; do test -s "keys/$f" || { echo "::error::keys/$f missing in the input"; exit 1; }; done
+          for f in asc-key-id asc-issuer-id; do echo "::add-mask::$(tr -d '\r\n' < keys/$f)"; done
+          python3 - <<'PY'
+          import json, os
+          d = json.load(open("IOS_INPUT.json"))
+          assert d["version"] == os.environ["VERSION"], d
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write("BUILD=%s\n" % d["build"])
+          print("Version", d["version"], "build", d["build"])
+          PY
+      - name: Send it to App Review
+        env:
+          REPLACE_PENDING: ${{ inputs.replace_pending }}
+          WHATS_NEW: ${{ inputs.whats_new }}
+          STATUS_ONLY: ${{ inputs.status_only }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyjwt cryptography
+          K="$RUNNER_TEMP/in/keys"
+          KEY_ID="$(tr -d '\r\n' < "$K/asc-key-id")" ISSUER="$(tr -d '\r\n' < "$K/asc-issuer-id")" KEY_P8="$(cat "$K/asc-key.p8")" \
+            python3 -u review/asc_submit.py
+      - name: Remove the key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/in"
